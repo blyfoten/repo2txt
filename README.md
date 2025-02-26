@@ -23,6 +23,42 @@ This web-based tool converts GitHub repository (or local directory) contents  in
 
 This tool runs entirely in the browser, ensuring data security without server-side processing.
 
+## Docker Support
+
+You can run this application in a Docker container with the following steps:
+
+### Prerequisites
+
+- Docker installed on your system
+
+### Building and Running the Docker Container
+
+1. Clone this repository:
+   ```
+   git clone https://github.com/yourusername/repo2txt.git
+   cd repo2txt
+   ```
+
+2. Build the Docker image:
+   ```
+   docker build -t repo2txt .
+   ```
+
+3. Run the container:
+   ```
+   docker run -d -p 8080:80 --name repo2txt-container repo2txt
+   ```
+
+4. Access the application in your browser:
+   ```
+   http://localhost:8080
+   ```
+
+### Stopping the Container
+
+```
+docker stop repo2txt-container
+```
 
 ## To do
 
