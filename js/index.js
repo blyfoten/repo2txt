@@ -24,6 +24,42 @@ function saveToken(token) {
     }
 }
 
+// Parse GitHub or GitLab repository URL
+function parseRepoUrl(url) {
+    url = url.replace(/\/$/, '');
+    
+    // GitHub URL pattern
+    const githubPattern = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)(\/tree\/(.+))?$/;
+    const githubMatch = url.match(githubPattern);
+    
+    if (githubMatch) {
+        return {
+            type: 'github',
+            owner: githubMatch[1],
+            repo: githubMatch[2],
+            lastString: githubMatch[4] || '',
+        };
+    }
+    
+    // GitLab URL pattern - handles both gitlab.com and custom GitLab instances
+    const gitlabPattern = /^https:\/\/([^\/]+)\/([^\/]+)\/([^\/]+)(\/\-\/tree\/(.+))?$/;
+    const gitlabMatch = url.match(gitlabPattern);
+    
+    if (gitlabMatch) {
+        return {
+            type: 'gitlab',
+            instance: gitlabMatch[1],
+            owner: gitlabMatch[2],
+            repo: gitlabMatch[3],
+            lastString: gitlabMatch[5] || '',
+        };
+    }
+    
+    throw new Error('Invalid repository URL. Please ensure the URL is in one of these formats: ' +
+        'https://github.com/owner/repo, https://github.com/owner/repo/tree/branch/path, ' +
+        'https://gitlab.example.com/owner/repo, or https://gitlab.example.com/owner/repo/-/tree/branch/path');
+}
+
 // Event listener for form submission
 document.getElementById('repoForm').addEventListener('submit', async function (e) {
     e.preventDefault();
@@ -38,25 +74,43 @@ document.getElementById('repoForm').addEventListener('submit', async function (e
 
     try {
         // Parse repository URL and fetch repository contents
-        const { owner, repo, lastString } = parseRepoUrl(repoUrl);
+        const repoInfo = parseRepoUrl(repoUrl);
         let refFromUrl = '';
         let pathFromUrl = '';
 
-        if (lastString) {
-            const references = await getReferences(owner, repo, accessToken);
-            const allRefs = [...references.branches, ...references.tags];
-            
-            const matchingRef = allRefs.find(ref => lastString.startsWith(ref));
-            if (matchingRef) {
-                refFromUrl = matchingRef;
-                pathFromUrl = lastString.slice(matchingRef.length + 1);
-            } else {
-                refFromUrl = lastString;
+        if (repoInfo.lastString) {
+            if (repoInfo.type === 'github') {
+                const references = await getReferences(repoInfo.owner, repoInfo.repo, accessToken, 'github');
+                const allRefs = [...references.branches, ...references.tags];
+                
+                const matchingRef = allRefs.find(ref => repoInfo.lastString.startsWith(ref));
+                if (matchingRef) {
+                    refFromUrl = matchingRef;
+                    pathFromUrl = repoInfo.lastString.slice(matchingRef.length + 1);
+                } else {
+                    refFromUrl = repoInfo.lastString;
+                }
+            } else if (repoInfo.type === 'gitlab') {
+                const references = await getReferences(repoInfo.owner, repoInfo.repo, accessToken, 'gitlab', repoInfo.instance);
+                const allRefs = [...references.branches, ...references.tags];
+                
+                const matchingRef = allRefs.find(ref => repoInfo.lastString.startsWith(ref));
+                if (matchingRef) {
+                    refFromUrl = matchingRef;
+                    pathFromUrl = repoInfo.lastString.slice(matchingRef.length + 1);
+                } else {
+                    refFromUrl = repoInfo.lastString;
+                }
             }
         }
 
-        const sha = await fetchRepoSha(owner, repo, refFromUrl, pathFromUrl, accessToken);
-        const tree = await fetchRepoTree(owner, repo, sha, accessToken);
+        let tree;
+        if (repoInfo.type === 'github') {
+            const sha = await fetchRepoSha(repoInfo.owner, repoInfo.repo, refFromUrl, pathFromUrl, accessToken, 'github');
+            tree = await fetchRepoTree(repoInfo.owner, repoInfo.repo, sha, accessToken, 'github');
+        } else if (repoInfo.type === 'gitlab') {
+            tree = await fetchGitLabTree(repoInfo.instance, repoInfo.owner, repoInfo.repo, refFromUrl, pathFromUrl, accessToken);
+        }
 
         displayDirectoryStructure(tree);
         document.getElementById('generateTextButton').style.display = 'flex';
@@ -148,87 +202,157 @@ document.getElementById('downloadButton').addEventListener('click', function () 
     URL.revokeObjectURL(url);
 });
 
-// Parse GitHub repository URL
-function parseRepoUrl(url) {
-    url = url.replace(/\/$/, '');
-    const urlPattern = /^https:\/\/github\.com\/([^\/]+)\/([^\/]+)(\/tree\/(.+))?$/;
-    const match = url.match(urlPattern);
-    if (!match) {
-        throw new Error('Invalid GitHub repository URL. Please ensure the URL is in the correct format: ' +
-            'https://github.com/owner/repo or https://github.com/owner/repo/tree/branch/path');
-    }
-    return {
-        owner: match[1],
-        repo: match[2],
-        lastString: match[4] || ''
-    };
-}
-
 // Fetch repository references
-async function getReferences(owner, repo, token) {
-    const headers = {
-        'Accept': 'application/vnd.github+json'
-    };
-    if (token) {
-        headers['Authorization'] = `token ${token}`;
+async function getReferences(owner, repo, token, type, instance = 'github.com') {
+    if (type === 'github') {
+        const headers = {
+            'Accept': 'application/vnd.github+json'
+        };
+        if (token) {
+            headers['Authorization'] = `token ${token}`;
+        }
+
+        const [branchesResponse, tagsResponse] = await Promise.all([
+            fetch(`https://api.github.com/repos/${owner}/${repo}/git/matching-refs/heads/`, { headers }),
+            fetch(`https://api.github.com/repos/${owner}/${repo}/git/matching-refs/tags/`, { headers })
+        ]);
+
+        if (!branchesResponse.ok || !tagsResponse.ok) {
+            throw new Error('Failed to fetch references');
+        }
+
+        const branches = await branchesResponse.json();
+        const tags = await tagsResponse.json();
+
+        return {
+            branches: branches.map(b => b.ref.split("/").slice(2).join("/")),
+            tags: tags.map(t => t.ref.split("/").slice(2).join("/"))
+        };
+    } else if (type === 'gitlab') {
+        const headers = {};
+        if (token) {
+            headers['Authorization'] = `Bearer ${token}`;
+        }
+
+        const encodedProject = encodeURIComponent(`${owner}/${repo}`);
+        const baseUrl = `https://${instance}/api/v4/projects/${encodedProject}`;
+        
+        const [branchesResponse, tagsResponse] = await Promise.all([
+            fetch(`${baseUrl}/repository/branches`, { headers }),
+            fetch(`${baseUrl}/repository/tags`, { headers })
+        ]);
+
+        if (!branchesResponse.ok || !tagsResponse.ok) {
+            throw new Error('Failed to fetch references');
+        }
+
+        const branches = await branchesResponse.json();
+        const tags = await tagsResponse.json();
+
+        return {
+            branches: branches.map(b => b.name),
+            tags: tags.map(t => t.name)
+        };
     }
-
-    const [branchesResponse, tagsResponse] = await Promise.all([
-        fetch(`https://api.github.com/repos/${owner}/${repo}/git/matching-refs/heads/`, { headers }),
-        fetch(`https://api.github.com/repos/${owner}/${repo}/git/matching-refs/tags/`, { headers })
-    ]);
-
-    if (!branchesResponse.ok || !tagsResponse.ok) {
-        throw new Error('Failed to fetch references');
-    }
-
-    const branches = await branchesResponse.json();
-    const tags = await tagsResponse.json();
-
-    return {
-        branches: branches.map(b => b.ref.split("/").slice(2).join("/")),
-        tags: tags.map(t => t.ref.split("/").slice(2).join("/"))
-    };
 }
 
 // Fetch repository SHA
-async function fetchRepoSha(owner, repo, ref, path, token) {
-    const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path ? `${path}` : ''}${ref ? `?ref=${ref}` : ''}`;
-    const headers = {
-        'Accept': 'application/vnd.github.object+json'
-    };
-    if (token) {
-        headers['Authorization'] = `token ${token}`;
+async function fetchRepoSha(owner, repo, ref, path, token, type, instance = 'github.com') {
+    if (type === 'github') {
+        const url = `https://api.github.com/repos/${owner}/${repo}/contents/${path ? `${path}` : ''}${ref ? `?ref=${ref}` : ''}`;
+        const headers = {
+            'Accept': 'application/vnd.github.object+json'
+        };
+        if (token) {
+            headers['Authorization'] = `token ${token}`;
+        }
+        const response = await fetch(url, { headers });
+        if (!response.ok) {
+            handleFetchError(response);
+        }
+        const data = await response.json();
+        return data.sha;
     }
+    // GitLab doesn't use SHA in the same way, so this function is only needed for GitHub
+}
+
+// Fetch GitLab repository tree
+async function fetchGitLabTree(instance, owner, repo, ref, path, token) {
+    const encodedProject = encodeURIComponent(`${owner}/${repo}`);
+    const encodedPath = path ? encodeURIComponent(path) : '';
+    
+    let url = `https://${instance}/api/v4/projects/${encodedProject}/repository/tree`;
+    const params = new URLSearchParams();
+    
+    if (ref) {
+        params.append('ref', ref);
+    }
+    
+    if (path) {
+        params.append('path', path);
+    }
+    
+    params.append('recursive', 'true');
+    
+    url = `${url}?${params.toString()}`;
+    
+    const headers = {};
+    if (token) {
+        headers['Authorization'] = `Bearer ${token}`;
+    }
+    
     const response = await fetch(url, { headers });
     if (!response.ok) {
         handleFetchError(response);
     }
+    
     const data = await response.json();
-    return data.sha;
+    
+    // Transform the GitLab format to match the GitHub format used by the rest of the app
+    return data.map(item => {
+        let type;
+        if (item.type === 'tree') {
+            type = 'tree';
+        } else if (item.type === 'blob') {
+            type = 'blob';
+        } else {
+            type = item.type;
+        }
+        
+        const itemPath = path ? `${path}/${item.path}` : item.path;
+        
+        return {
+            path: itemPath,
+            type: type,
+            url: `https://${instance}/api/v4/projects/${encodedProject}/repository/files/${encodeURIComponent(itemPath)}/raw${ref ? `?ref=${ref}` : ''}`
+        };
+    });
 }
 
 // Fetch repository tree
-async function fetchRepoTree(owner, repo, sha, token) {
-    const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`;
-    const headers = {
-        'Accept': 'application/vnd.github+json'
-    };
-    if (token) {
-        headers['Authorization'] = `token ${token}`;
+async function fetchRepoTree(owner, repo, sha, token, type, instance = 'github.com') {
+    if (type === 'github') {
+        const url = `https://api.github.com/repos/${owner}/${repo}/git/trees/${sha}?recursive=1`;
+        const headers = {
+            'Accept': 'application/vnd.github+json'
+        };
+        if (token) {
+            headers['Authorization'] = `token ${token}`;
+        }
+        const response = await fetch(url, { headers });
+        if (!response.ok) {
+            handleFetchError(response);
+        }
+        const data = await response.json();
+        return data.tree;
     }
-    const response = await fetch(url, { headers });
-    if (!response.ok) {
-        handleFetchError(response);
-    }
-    const data = await response.json();
-    return data.tree;
+    // This function is only needed for GitHub since fetchGitLabTree is separate
 }
 
 // Handle fetch errors
 function handleFetchError(response) {
     if (response.status === 403 && response.headers.get('X-RateLimit-Remaining') === '0') {
-        throw new Error('GitHub API rate limit exceeded. Please try again later or provide a valid access token to increase your rate limit.');
+        throw new Error('API rate limit exceeded. Please try again later or provide a valid access token to increase your rate limit.');
     }
     if (response.status === 404) {
         throw new Error(`Repository, branch, or path not found. Please check that the URL, branch/tag, and path are correct and accessible.`);
@@ -238,20 +362,33 @@ function handleFetchError(response) {
 
 // Fetch contents of selected files
 async function fetchFileContents(files, token) {
-    const headers = {
-        'Accept': 'application/vnd.github.v3.raw'
-    };
-    if (token) {
-        headers['Authorization'] = `token ${token}`;
-    }
-    const contents = await Promise.all(files.map(async file => {
+    let contents = [];
+    
+    for (const file of files) {
+        // Determine if this is a GitHub or GitLab URL
+        const isGitLab = file.url.includes('/api/v4/projects/');
+        
+        const headers = {};
+        if (token) {
+            if (isGitLab) {
+                headers['Authorization'] = `Bearer ${token}`;
+            } else {
+                headers['Authorization'] = `token ${token}`;
+                headers['Accept'] = 'application/vnd.github.v3.raw';
+            }
+        } else if (!isGitLab) {
+            headers['Accept'] = 'application/vnd.github.v3.raw';
+        }
+        
         const response = await fetch(file.url, { headers });
         if (!response.ok) {
             handleFetchError(response);
         }
+        
         const text = await response.text();
-        return { url: file.url, path: file.path, text };
-    }));
+        contents.push({ url: file.url, path: file.path, text });
+    }
+    
     return contents;
 }
 
